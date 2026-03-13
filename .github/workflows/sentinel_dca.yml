@@ -1,0 +1,54 @@
+name: Sentinel DCA — Daily Report
+
+on:
+  schedule:
+    # Lunes a viernes a las 21:00 UTC (18:00 ART / cierre mercado NY)
+    - cron: "0 21 * * 1-5"
+  workflow_dispatch:   # permite ejecución manual desde la UI de GitHub
+
+jobs:
+  run-sentinel:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout del repositorio
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 2. Restaurar historial cacheado de ejecuciones anteriores
+      - name: Restaurar historial
+        uses: actions/cache@v4
+        with:
+          path: historial.json
+          key: sentinel-historial-${{ runner.os }}
+          # restore-keys permite usar la última cache aunque la key exacta no exista
+          restore-keys: |
+            sentinel-historial-
+
+      # 3. Configurar Python
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 4. Instalar dependencias
+      - name: Instalar dependencias
+        run: |
+          pip install --upgrade pip
+          pip install yfinance pandas numpy requests
+
+      # 5. Ejecutar el bot
+      - name: Ejecutar Sentinel DCA
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python sentinel_dca.py
+
+      # 6. Guardar historial actualizado en cache
+      #    Se ejecuta siempre (incluso si el paso anterior falla)
+      - name: Guardar historial actualizado
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: historial.json
+          key: sentinel-historial-${{ runner.os }}
