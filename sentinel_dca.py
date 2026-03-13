@@ -129,6 +129,105 @@ def calculate_mfi(df: pd.DataFrame, window: int = 14) -> pd.Series:
     return 100 - (100 / (1 + mfr))
 
 
+# ─── Tendencia RSI ─────────────────────────────────────────────────────────────
+def analizar_tendencia_rsi(rsi_series: pd.Series, precio_series: pd.Series, ventana: int = 5) -> dict:
+    """
+    Analiza la tendencia del RSI en los últimos N días.
+    Retorna:
+      - valores      : lista de los últimos N valores de RSI
+      - direccion    : 'subiendo' | 'bajando' | 'lateral'
+      - pendiente    : puntos/día (float)
+      - divergencia  : True si precio baja pero RSI sube (señal alcista)
+      - descripcion  : texto listo para el mensaje
+      - emoji        : emoji representativo
+    """
+    rsi_ult   = rsi_series.dropna().iloc[-ventana:]
+    precio_ult = precio_series.dropna().iloc[-ventana:]
+
+    if len(rsi_ult) < ventana:
+        return {"descripcion": "", "emoji": "", "divergencia": False, "pendiente": 0.0, "direccion": "lateral", "valores": []}
+
+    valores   = [round(v, 1) for v in rsi_ult.tolist()]
+    pendiente = float(np.polyfit(range(ventana), rsi_ult.values, 1)[0])  # puntos RSI por día
+
+    # Dirección: umbral de ±0.3 pts/día para evitar ruido
+    if pendiente > 0.3:
+        direccion = "subiendo"
+        emoji_dir = "📈"
+    elif pendiente < -0.3:
+        direccion = "bajando"
+        emoji_dir = "📉"
+    else:
+        direccion = "lateral"
+        emoji_dir = "➡️"
+
+    # Divergencia alcista: precio hace mínimos más bajos pero RSI hace mínimos más altos
+    precio_baja = precio_ult.iloc[-1] < precio_ult.iloc[0]
+    rsi_sube    = rsi_ult.iloc[-1]   > rsi_ult.iloc[0]
+    divergencia = precio_baja and rsi_sube
+
+    # Texto de tendencia (5 valores como mini sparkline)
+    sparkline = " → ".join([str(v) for v in valores])
+    desc = f"{emoji_dir} *Tendencia RSI ({ventana}d):* {sparkline}\n"
+    desc += f"   Dirección: *{direccion}* ({pendiente:+.1f} pts/día)"
+
+    if divergencia:
+        desc += "\n   ✨ *Divergencia alcista detectada:* precio baja, RSI sube — posible suelo"
+
+    return {
+        "valores":     valores,
+        "direccion":   direccion,
+        "pendiente":   pendiente,
+        "divergencia": divergencia,
+        "descripcion": desc,
+        "emoji":       emoji_dir,
+    }
+
+
+def ajustar_cuota_por_tendencia_rsi(cuota: str, tendencia: dict) -> tuple[str, str]:
+    """
+    Ajusta la cuota sugerida según la tendencia del RSI.
+    Retorna (cuota_ajustada, nota_ajuste).
+    Solo actúa en casos con señal clara para no generar ruido.
+    """
+    direccion   = tendencia.get("direccion", "lateral")
+    pendiente   = tendencia.get("pendiente", 0.0)
+    divergencia = tendencia.get("divergencia", False)
+
+    nota = ""
+
+    # Caso 1: TRIPLE con RSI cayendo rápido → degradar a DOBLE, esperar confirmación
+    if cuota == "TRIPLE" and direccion == "bajando" and pendiente < -1.5:
+        return (
+            "DOBLE (Degradada — RSI en caída libre)",
+            "⚠️ RSI cayendo más de 1.5 pts/día. Posible continuación bajista. Se degrada a DOBLE; reservá la 3ra cuota para confirmación de suelo.",
+        )
+
+    # Caso 2: TRIPLE con divergencia alcista → mantener TRIPLE y destacarlo
+    if cuota == "TRIPLE" and divergencia:
+        return (
+            "TRIPLE",
+            "✨ Divergencia alcista confirma la señal. Entrada de alta convicción.",
+        )
+
+    # Caso 3: DOBLE con RSI cayendo — ser más cauteloso
+    if cuota == "DOBLE" and direccion == "bajando" and pendiente < -1.0:
+        return (
+            "SIMPLE (Degradada — RSI deteriorándose)",
+            "⚠️ RSI en tendencia bajista. Descuento podría profundizarse. Se degrada a SIMPLE.",
+        )
+
+    # Caso 4: DOBLE con divergencia — confirmar la doble cuota
+    if cuota == "DOBLE" and divergencia:
+        return (
+            "DOBLE",
+            "✨ Divergencia alcista: el retroceso muestra agotamiento vendedor. DOBLE justificada.",
+        )
+
+    # Sin ajuste
+    return cuota, nota
+
+
 # ─── Descarga de datos ─────────────────────────────────────────────────────────
 def descargar_ticker(ticker: str, period: str = "1y") -> pd.DataFrame:
     """Descarga un ticker y normaliza columnas ante MultiIndex de yfinance >= 0.2."""
@@ -182,7 +281,11 @@ def main():
     mfi_iwm    = calculate_mfi(df_iwm).iloc[-1]
     climax_vol = spy_vol > (avg_vol * 1.5)
 
-    log.info(f"SPY={spy_close:.2f} | VIX={vix_close:.1f} | RSI={rsi_val:.1f} | MFI_SPY={mfi_spy:.1f} | MFI_IWM={mfi_iwm:.1f}")
+    # 5b. Tendencia RSI (últimos 5 días)
+    rsi_series = calculate_rsi(df_spy["Close"])
+    tendencia  = analizar_tendencia_rsi(rsi_series, df_spy["Close"], ventana=5)
+
+    log.info(f"SPY={spy_close:.2f} | VIX={vix_close:.1f} | RSI={rsi_val:.1f} | MFI_SPY={mfi_spy:.1f} | MFI_IWM={mfi_iwm:.1f} | RSI_dir={tendencia['direccion']} ({tendencia['pendiente']:+.1f})")
 
     # 6. Lógica DCA — zonas explícitas sin solapamiento
     #    Pánico: SPY bajo SMA50 + RSI bajo 40, o VIX alto, o RSI extremo
@@ -244,6 +347,9 @@ def main():
     # Nota de volumen climático (informativa)
     nota_vol = "\n📢 *Nota:* Volumen climático detectado (>1.5x promedio). Señal de capitulación posible." if climax_vol else ""
 
+    # 7b. Ajuste de cuota por tendencia RSI
+    cuota, nota_tendencia = ajustar_cuota_por_tendencia_rsi(cuota, tendencia)
+
     # 8. Historial
     historial      = cargar_historial()
     bloque_historial = formatear_historial(historial, cuota)
@@ -257,14 +363,18 @@ def main():
     mensaje += f"📈 *RSI SPY:* {rsi_val:.1f}\n"
     mensaje += f"🌊 *MFI SPY:* {mfi_spy:.1f}\n"
     mensaje += f"🦅 *MFI IWM (Small Caps):* {mfi_iwm:.1f}\n"
+    if tendencia["descripcion"]:
+        mensaje += f"\n{tendencia['descripcion']}\n"
     mensaje += nota_vol + "\n\n"
 
     if alerta_iwm:
         mensaje += f"{alerta_iwm}\n\n"
 
     mensaje += f"⚖️ *ESTADO:* {status}\n"
-    mensaje += f"💰 *CUOTA SUGERIDA:* *{cuota}*\n\n"
-    mensaje += f"📋 *DETALLE OPERATIVO:*\n{detalle_accion}\n"
+    mensaje += f"💰 *CUOTA SUGERIDA:* *{cuota}*\n"
+    if nota_tendencia:
+        mensaje += f"_{nota_tendencia}_\n"
+    mensaje += f"\n📋 *DETALLE OPERATIVO:*\n{detalle_accion}\n"
 
     if bloque_historial:
         mensaje += f"\n{bloque_historial}"
